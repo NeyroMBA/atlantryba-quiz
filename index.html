@@ -505,6 +505,9 @@ tbody tr.row-dimmed:hover { opacity: 0.75; }
 .mp-games { display: grid; gap: 6px; margin-top: 6px; }
 .mp-game { text-align: left; border: 1px solid var(--border); background: var(--card-bg); color: var(--text); border-radius: 8px; padding: 8px 10px; font-size: 12.5px; cursor: pointer; font-family: var(--font); }
 .mp-game:hover { background: var(--bg); }
+.mp-game.done { opacity: .6; }
+.mp-open-code { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
+.mp-open-code .mp-input { width: 90px; flex: 0 0 auto; }
 .mp-chip.left { opacity: .5; }
 .res-note { margin: 0 0 8px; font-size: 12px; }
 /* по id — сильнее ширины панели ведущего и свёрнутого режима */
@@ -4932,18 +4935,50 @@ async function mpLoadMyGames() {
   let last = ''; try { last = localStorage.getItem('atlantQuizHostLast') || ''; } catch (e) {}
   const back = /^\d{4}$/.test(last)
     ? '<button class="mp-btn mp-btn-inline" onclick="mpReturnHost(\'' + last + '\')">↩ Вернуться в игру ' + last + '</button>' : '';
-  box.innerHTML = back;
+  // открыть любую игру или задание по коду — например, созданные на другом устройстве
+  const byCode = MP.db.isTest ? '' : '<div class="mp-open-code"><input id="mpOpenCode" class="mp-input mp-code" maxlength="4" inputmode="numeric" placeholder="0000">' +
+    '<button class="mp-btn mp-btn-inline" onclick="mpAdoptGame(document.getElementById(\'mpOpenCode\').value.trim())">Открыть игру или задание по коду</button></div>';
+  box.innerHTML = back + byCode;
   if (MP.db.isTest) return;
+  // игры с ведущим за последние 6 часов — открыть, продолжить или завершить
+  MP.db.hw({ action: 'livegames', admin: mpAdminToken() }).then(j => {
+    const el = document.getElementById('mpLiveGames'); if (!el) return;
+    const st = g => g.status === 'lobby' ? 'не начата' : g.status === 'finished' ? 'завершена'
+      : g.status === 'intro2' ? 'идёт · перед частью 2' : 'идёт · вопрос ' + (g.qIdx + 1) + ' из ' + QUIZ_QUESTIONS.length;
+    const list = (j.games || []).filter(g => /^\d{4}$/.test(g.code));
+    el.innerHTML = list.length ? '<div class="mp-subtitle">Игры с ведущим за последние 6 часов</div><div class="mp-games">' + list.map(g =>
+      '<button class="mp-game' + (g.status === 'finished' ? ' done' : '') + '" onclick="mpAdoptGame(\'' + g.code + '\')"><b>Игра ' + g.code + '</b> · группа ' + mpEsc(g.group) + ' · ' +
+      new Date(g.createdAt).toLocaleTimeString('ru', { hour: '2-digit', minute: '2-digit' }) + ' · ' + st(g) + ' · участников: ' + g.players + '</button>').join('') + '</div>' : '';
+  }).catch(() => {});
+  box.insertAdjacentHTML('beforeend', '<div id="mpLiveGames"></div><div id="mpHwGames"></div>');
   try {
     const j = await MP.db.hw({ action: 'games', admin: mpAdminToken() });
     const list = (j.games || []).filter(g => /^\d{4}$/.test(g.code)).slice(0, 8);
-    if (!document.getElementById('mpMyGames')) return;
-    box.innerHTML = back + (list.length ? '<div class="mp-subtitle">Домашние задания</div><div class="mp-games">' + list.map(g =>
+    const hwBox = document.getElementById('mpHwGames');
+    if (!hwBox) return;
+    hwBox.innerHTML = (list.length ? '<div class="mp-subtitle">Домашние задания</div><div class="mp-games">' + list.map(g =>
       '<button class="mp-game" onclick="hwHostOpen(\'' + g.code + '\')"><b>ДЗ ' + g.code + '</b> · группа ' + mpEsc(g.group) + ' · ' +
       new Date(g.createdAt).toLocaleDateString('ru') + ' · участников: ' + g.players + ' · ' + (g.open ? 'приём открыт' : 'приём закрыт') + '</button>').join('') + '</div>' : '');
   } catch (e) {
     if (e.code === 'admin only') { mpSetAdminToken(null); mpShowLogin('Вход ведущего истёк — войдите снова.'); }
     else if (e.code === 'unknown action' && document.getElementById('mpMyGames')) box.innerHTML = back + '<div class="mp-error">' + MP_OLD_SCRIPT + '</div>';
+  }
+}
+// Открыть игру или задание по коду (с любого устройства: таблица выдаёт ключ ведущего вошедшему ведущему)
+async function mpAdoptGame(code) {
+  const err = document.getElementById('mpHostError');
+  if (!/^\d{4}$/.test(code)) { if (err) err.textContent = 'Код — 4 цифры.'; return; }
+  if (err) err.textContent = 'Открываем ' + code + '…';
+  try {
+    const j = await MP.db.hw({ action: 'adopt', admin: mpAdminToken(), room: code });
+    if (j.type === 'hw') return hwHostOpen(code);
+    try { localStorage.setItem('atlantQuizHostKey:' + code, j.hostKey); } catch (e) {}
+    if (err) err.textContent = '';
+    mpEnter('host', code);
+  } catch (e) {
+    if (e.code === 'admin only') { mpSetAdminToken(null); mpShowLogin('Вход ведущего истёк — войдите снова.'); return; }
+    if (err) err.textContent = e.code === 'not found' ? 'Игра или задание ' + code + ' не найдены. Игры с ведущим хранятся 6 часов.'
+      : e.code === 'unknown action' ? MP_OLD_SCRIPT : 'Не удалось открыть — проверьте интернет и попробуйте ещё раз.';
   }
 }
 async function mpReturnHost(code) {
@@ -5305,7 +5340,8 @@ function mpNext() {
 // Итоги игры: рейтинг в таблицу — по вопросам, которые были (игру можно завершить досрочно)
 function mpFinish() {
   const d = MP.data, meta = d.meta, asked = Object.keys(d.results || {}).length;
-  mpLogRows('Рейтинг', ['Группа', 'Код игры', 'Место', 'Имя', 'Баллы', 'Верных', 'Вопросов', 'Время верных ответов, сек'],
+  // игра не начиналась — в таблицу писать нечего
+  if (asked) mpLogRows('Рейтинг', ['Группа', 'Код игры', 'Место', 'Имя', 'Баллы', 'Верных', 'Вопросов', 'Время верных ответов, сек'],
     mpRanking(d).map((x, i) => [meta.group || '', MP.room, i + 1, x.name, x.score, x.correct, asked, Math.round(x.time / 100) / 10]));
   MP.showStats = false;
   return mpMeta({ status: 'finished', asked: asked });
@@ -5323,7 +5359,9 @@ async function mpFinishNow() {
   return mpFinish();
 }
 function mpAskFinish(el) {
-  if (!confirm('Завершить игру сейчас? Итоги и рейтинг — по вопросам, которые уже прошли. Результаты сохранятся в таблицу.')) return;
+  const lobby = MP.data && MP.data.meta && MP.data.meta.status === 'lobby';
+  if (!confirm(lobby ? 'Завершить игру? Она ещё не началась — в таблицу ничего не запишется, участники увидят, что игра завершена.'
+    : 'Завершить игру сейчас? Итоги и рейтинг — по вопросам, которые уже прошли. Результаты сохранятся в таблицу.')) return;
   mpRun(el, () => mpFinishNow());
 }
 // Промежуточный рейтинг ведущего (игра при этом идёт дальше)
@@ -5560,6 +5598,11 @@ function mpRenderPlayer(d, meta, body, footer, s) {
     footer.innerHTML = '<div class="mp-note">Переключитесь на «Моделирование» — ведущий скоро откроет вопрос.</div>';
     return;
   }
+  if (meta.status === 'finished' && meta.asked === 0) {
+    body.innerHTML = '<div class="mp-wait-big">Ведущий завершил игру.</div><p class="mp-muted">Можно выйти и пройти квиз самостоятельно.</p>';
+    footer.innerHTML = '';
+    return;
+  }
   if (meta.status === 'finished') {
     const r = mpRanking(d), i = r.findIndex(x => x.uid === MP.uid), me = r[i];
     body.innerHTML = '<div class="quiz-results"><div class="quiz-results-emoji">' + (i === 0 ? '🏆' : i < 3 ? '🥈' : '🐟') + '</div>' +
@@ -5592,6 +5635,11 @@ function mpStatsHTML(d, s, title) {
 // Экран ведущего + во время игры: «Рейтинг» (промежуточный) и «Завершить игру»
 function mpRenderHost(d, meta, body, footer, s) {
   mpRenderHostMain(d, meta, body, footer, s);
+  if (meta.status === 'lobby') {
+    MP.showStats = false;
+    footer.insertAdjacentHTML('beforeend', '<div class="mp-controls mp-controls-sub"><button class="mp-btn" onclick="mpAskFinish(this)">⏹ Завершить игру</button></div>');
+    return;
+  }
   if (['question', 'closed', 'reveal', 'intro2'].indexOf(meta.status) < 0) { MP.showStats = false; return; }
   if (MP.showStats) body.innerHTML = (meta.status === 'question' || meta.status === 'closed' ? mpTimerHTML() : '') + mpStatsHTML(d, s, 'Промежуточный рейтинг');
   footer.insertAdjacentHTML('beforeend', '<div class="mp-controls mp-controls-sub">' +
