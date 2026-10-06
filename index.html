@@ -5107,16 +5107,31 @@ function mpBootFromUrl() {
   if (!room && !host) return false;
   (async () => {
     if (host) {
+      let gone = false;
       if (room) {
-        mpWelcomeForm('<div class="mp-form-title">Режим ведущего</div><div class="mp-wait">Подключение к игре ' + mpEsc(room) + '…</div>');
+        mpWelcomeForm('<div class="mp-form-title">Режим ведущего</div><div class="mp-wait">Подключение…</div>');
         try {
           await mpConnect();
+          // ни входа ведущего, ни ключа от этой игры — ждать ответа таблицы незачем, сразу форма входа
+          if (!MP.db.isTest && !mpAdminToken() && !MP.db.isHostOf(room)) throw new Error('skip');
           const meta = await MP.db.get('rooms/' + room + '/meta');
           if (meta && meta.type === 'hw') { if (mpAdminToken()) { hwHostOpen(room); return; } }
           else if (meta && (meta.hostId === MP.uid || (MP.db.isHostOf && MP.db.isHostOf(room)))) { mpEnter('host', room); return; }
+          else if (meta && mpAdminToken() && !MP.db.isTest) {
+            // ведущий вошёл, а игра создана на другом устройстве — открываем её (ключ ведущего выдаёт таблица)
+            try {
+              const j = await MP.db.hw({ action: 'adopt', admin: mpAdminToken(), room });
+              if (j.hostKey) { try { localStorage.setItem('atlantQuizHostKey:' + room, j.hostKey); } catch (e) {} mpEnter('host', room); return; }
+            } catch (e) {}
+          }
+          gone = !meta;
         } catch (e) {}
+        // ссылка на старую игру — убираем её код из адреса, чтобы при обновлении страницы это не повторялось
+        try { history.replaceState(null, '', location.pathname + '?host'); } catch (e) {}
       }
       await mpShowHost();
+      const err = document.getElementById('mpHostError');
+      if (gone && err) err.textContent = 'Игры ' + room + ' уже нет: игры с ведущим хранятся 6 часов. Её итоги — в «Результатах по группам».';
     } else {
       mpShowJoin(room);
       try {
