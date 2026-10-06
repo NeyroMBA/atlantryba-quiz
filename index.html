@@ -4584,7 +4584,7 @@ var qrcode = function() {
 // Онлайн-игра и запись результатов в Google-таблицу: URL веб-приложения Apps Script (заканчивается на /exec).
 // Как получить — НАСТРОЙКА_ОНЛАЙН-ИГРЫ.md и КОД_ДЛЯ_ТАБЛИЦЫ.gs.
 // Пока null — ТЕСТОВЫЙ режим: игра работает только между вкладками этого браузера, в таблицу ничего не пишется.
-const MP_SHEETS_URL = "https://script.google.com/macros/s/AKfycbx0ygwnaV8lFFaGplZyIlq8PLy6YSEYipu1Utr_U5wHYKOo2ANPFMbyfutK7Vdfa_ar/exec";
+const MP_SHEETS_URL = "https://script.google.com/macros/s/AKfycbwUnZMCIUTyXajsePXx470xTIhOxidN2JaD_kSR5A8WOv5AmHd1vEsqDlV7skTAFY3L/exec";
 // Адрес квиза в интернете (GitHub Pages), например 'https://имя.github.io/atlantryba-quiz/'. На него ведут ссылка для входа и QR-код,
 // даже если ведущий открыл квиз с компьютера. Пусто — используется адрес, с которого открыт квиз (если это сайт).
 const QUIZ_PUBLIC_URL = 'https://neyromba.github.io/atlantryba-quiz/';
@@ -4710,6 +4710,12 @@ function mpSheetsBackend(url) {
     isHostOf(code) { return !!hostKey(code); },
     tok,
     hw(payload) { return call(payload); },        // домашнее задание и список заданий
+    // подсчёт баллов за вопрос: таблица сама дожидается последних ответов, считает и сразу возвращает итог
+    async reveal(code, payload) {
+      const j = await call(Object.assign({ action: 'reveal', room: code, key: hostKey(code) }, payload));
+      watchers.filter(w => w.code === code).forEach(w => w.replace(j.data));
+      return j;
+    },
     now: () => Date.now() + offset,
     async get(p) {
       const { code, rest } = split(p);
@@ -4747,6 +4753,10 @@ function mpSheetsBackend(url) {
           inflight = fetchOnce().finally(() => { inflight = null; });
           return inflight;
         },
+        replace(d) {                      // готовое состояние игры из ответа таблицы
+          if (stopped || !d) return;
+          appliedAt = Date.now(); last = JSON.stringify(d); cb(d);
+        },
         applyLocal(ops, now) {            // применить свою запись к последнему состоянию
           if (stopped || !last) return;
           const d = JSON.parse(last);
@@ -4755,10 +4765,19 @@ function mpSheetsBackend(url) {
         }
       };
       watchers.push(w); w.poll();
-      const timer = setInterval(() => w.poll(), MP_POLL_MS[MP.mode] || 1500);
+      let timer = null;
+      const loop = () => { timer = setTimeout(() => { w.poll(); if (!stopped) loop(); }, mpPollDelay()); };
+      loop();
       return () => { stopped = true; clearInterval(timer); watchers.splice(watchers.indexOf(w), 1); };
     }
   };
+}
+
+// Пока участник ждёт рейтинг (время вышло, ответ уже виден) — спрашиваем таблицу чаще
+function mpPollDelay() {
+  const m = MP.data && MP.data.meta;
+  if (MP.mode === 'player' && m && MP.preQ === m.qIdx && (m.status === 'question' || m.status === 'closed')) return 1200;
+  return MP_POLL_MS[MP.mode] || 1500;
 }
 
 // Запись строк в лист таблицы — с повтором, если связь пропала
@@ -5119,14 +5138,19 @@ function mpTick() {
     // время вышло, ответили все или ведущий нажал «Далее» → сразу подсчёт и показ ответа
     const d = MP.data, nAns = Object.keys((d.answers && d.answers[meta.qIdx]) || {}).length, nPl = Object.values(d.players || {}).filter(p => !p.left).length;
     const allIn = nPl > 0 && nAns >= nPl;
-    const due = meta.status === 'closed' || (!meta.pausedAt && (rem <= 0 || allIn));
+    const early = MP.endEarly === meta.qIdx;
+    const due = meta.status === 'closed' || early || (!meta.pausedAt && (rem <= 0 || allIn));
     if (due && !MP.revealing && !(d.results && d.results[meta.qIdx]) && Date.now() - (MP.revealFailAt || 0) > 5000) {
       MP.revealing = true; MP.renderKey = ''; mpRender();
-      mpReveal(allIn && meta.status === 'question')
+      mpReveal({ all: allIn && meta.status === 'question', early })
         .catch(() => { MP.revealFailAt = Date.now(); mpToast('Нет связи с таблицей — повторяем подсчёт…'); })
         .finally(() => { MP.revealing = false; MP.renderKey = ''; mpRender(); });
     }
-  } else if (meta.status === 'question' && !meta.pausedAt && rem <= 0) mpLockPlayer();
+  } else if (meta.status === 'question' && !meta.pausedAt && rem <= 0) {
+    mpLockPlayer();
+    // время вышло — участник сразу видит, верно ли ответил; рейтинг подтянется после подсчёта
+    if (MP.preQ !== meta.qIdx) { MP.preQ = meta.qIdx; MP.renderKey = ''; mpRender(); }
+  }
 }
 
 // Если игра открыта у ведущего в нескольких вкладках, подсчёт ведёт одна — та, где ведущий нажимал кнопки последним
@@ -5187,6 +5211,10 @@ function mpAddTime() {
 }
 // «Далее»: закончить время досрочно — ответ откроется сам
 function mpEndNow() {
+  if (MP.db.reveal && !MP.oldScript) { MP.endEarly = MP.data.meta.qIdx; mpTick(); return Promise.resolve(); }
+  return mpCloseNow();
+}
+function mpCloseNow() {        // старый скрипт таблицы: сначала закрыть приём ответов
   const close = () => mpMeta({ status: 'closed', closedAt: MP_TS });
   return MP.data.meta.pausedAt ? mpResume().then(close) : close();
 }
@@ -5196,8 +5224,38 @@ function mpAnswerTime(meta, a) {
   const el = typeof a.el === 'number' ? a.el : (a.at || 0) - meta.startedAt - mpPausedBefore(meta, a.at || 0);
   return Math.min(Math.max(0, el), mpShown(meta) * 1000);
 }
-// Подсчёт баллов — делает ведущий
-async function mpReveal(noWait) {
+// Подсчёт баллов: одним запросом к таблице (она сама дожидается ответов, отправленных в последний момент).
+// opt: { all — ответили все, early — ведущий нажал «Далее» }
+async function mpReveal(opt) {
+  opt = opt || {};
+  if (MP.db.reveal && !MP.oldScript) {
+    const qi = MP.data.meta.qIdx, q = QUIZ_QUESTIONS[qi];
+    try {
+      const j = await MP.db.reveal(MP.room, { q: qi, correct: q.correct, base: MP_BASE_POINTS, speed: MP_SPEED_POINTS, early: !!opt.early, all: !!opt.all });
+      if (j.fresh) mpLogAnswers(j.data, qi);
+      return;
+    } catch (e) {
+      if (e.code === 'stale') return;                  // ведущий уже перешёл к другому вопросу
+      if (e.code !== 'unknown action') throw e;
+      MP.oldScript = true;                              // скрипт таблицы не обновлён — считаем по-старому
+      if (opt.early && MP.data.meta.status === 'question') await mpCloseNow();
+    }
+  }
+  return mpRevealOld(!!opt.all);
+}
+// Ответы участников — в лист «Ответы»
+function mpLogAnswers(d, qi) {
+  const q = QUIZ_QUESTIONS[qi], meta = d.meta || {}, answers = (d.answers && d.answers[qi]) || {}, res = (d.results && d.results[qi]) || {};
+  mpLogRows('Ответы', ['Группа', 'Код игры', '№', 'Вопрос', 'Имя', 'Ответ', 'Результат', 'Баллы', 'Время ответа, сек', 'Формат'],
+    Object.entries(d.players || {}).map(([uid, p]) => {
+      const a = answers[uid], r = res[uid] || {};
+      const text = a && a.choice ? Object.values(a.choice).map(i => q.opts[i]).join('; ') : '';
+      return [meta.group || '', MP.room, qi + 1, q.text, p.name || '', text, !a ? 'не ответил' : r.correct ? 'верно' : 'неверно',
+        r.points || 0, a ? Math.round((r.el || 0) / 100) / 10 : '', 'Игра'];
+    }));
+}
+// Подсчёт в браузере ведущего — для тестового режима и старого скрипта таблицы
+async function mpRevealOld(noWait) {
   // ответы, отправленные в последнюю секунду, ещё в пути — даём им дойти (не больше MP_GRACE_SEC)
   const m0 = MP.data.meta;
   if (!noWait && !MP.db.isTest && m0.startedAt) {
@@ -5259,7 +5317,7 @@ async function mpFinishNow() {
   const open = (meta.status === 'question' || meta.status === 'closed') && !(d.results && d.results[qi]);
   if (open && Object.keys((d.answers && d.answers[qi]) || {}).length) {
     MP.revealing = true;
-    try { if (meta.status === 'question') await mpEndNow(); await mpReveal(); }
+    try { await mpReveal({ early: true }); }
     finally { MP.revealing = false; }
   }
   return mpFinish();
@@ -5291,7 +5349,7 @@ async function mpSubmit() {
   const meta = MP.data.meta, qi = meta.qIdx;
   if (meta.status !== 'question' || meta.pausedAt || mpPlayerRemaining(meta) <= 0 || !MP.sel.length || MP.mine[qi]) return;
   const ans = { choice: MP.sel.slice().sort((a, b) => a - b), el: Math.round(mpLocal(meta)), at: MP_TS };
-  const mine = MP.mine[qi] = { choice: ans.choice, state: 'sending' };
+  const mine = MP.mine[qi] = { choice: ans.choice, el: ans.el, state: 'sending' };
   MP.renderKey = ''; mpRender();                       // сразу показываем «Ответ принят»
   for (let i = 0; i < 4; i++) {
     try { await MP.db.set('rooms/' + MP.room + '/answers/' + qi + '/' + MP.uid, ans); mine.state = 'ok'; break; }
@@ -5409,7 +5467,7 @@ function mpRender() {
   const key = MP.mode === 'host'
     ? JSON.stringify([meta.status, qi, !!meta.pausedAt, nPlayers, Object.keys(answers).length, !!res, MP.nextTime, meta.status === 'lobby' ? d.players : 0, meta.status === 'finished' || MP.showStats ? [d.scores, Object.keys(d.results || {}).length] : 0, !!MP.revealing, !!MP.showStats])
     : JSON.stringify([meta.status, qi, !!meta.pausedAt, !!my, MP.mine[qi] ? MP.mine[qi].state : 0, res ? res[MP.uid] : 0, meta.status === 'lobby' ? nPlayers : 0,
-        ['reveal', 'intro2', 'finished'].indexOf(meta.status) >= 0 ? [d.scores, res] : 0]);
+        ['reveal', 'intro2', 'finished'].indexOf(meta.status) >= 0 ? [d.scores, res] : 0, MP.preQ === qi, nPlayers > 0 && Object.keys(answers).length >= nPlayers]);
   if (key === MP.renderKey) return;
   const sameQ = MP.renderKey && JSON.parse(MP.renderKey)[1] === qi;
   MP.renderKey = key;
@@ -5432,6 +5490,31 @@ function mpRender() {
   mpTick();
 }
 
+// Результат участника за вопрос. r: { answered, correct, points, pending }; local — посчитано в квизе, рейтинга ещё нет
+function mpPlayerResultHTML(d, meta, s, r) {
+  const q = QUIZ_QUESTIONS[s.qi], correctNames = q.correct.map(i => q.opts[i]).join(', ');
+  const local = !!(r && r.local);
+  const fb = !r || !r.answered ? '<div class="quiz-feedback show wrong-fb"><b>⏱ Вы не успели ответить.</b> Правильный ответ: <b>' + mpEsc(correctNames) + '</b>'
+    : r.correct ? '<div class="quiz-feedback show correct-fb"><b>✅ Верно! +' + mpFmt(r.points) + ' ' + pointsWord(r.points) + '</b>' + (r.pending ? ' <span class="mp-muted">(ответ ещё отправляется)</span>' : '')
+    : '<div class="quiz-feedback show wrong-fb"><b>❌ Неверно.</b> Правильный ответ: <b>' + mpEsc(correctNames) + '</b>';
+  const my = s.my || MP.mine[s.qi];
+  return mpStepHTML(s.qi) + '<div class="quiz-question-text">' + mpEsc(q.text) + '</div>' +
+    mpOptionsHTML(q, meta, 'reveal', my, meta.status === 'reveal' ? mpCounts(s.answers, q) : null, s.nPlayers) +
+    fb + (q.hint ? '<div class="quiz-hint">💡 ' + mpEsc(q.hint) + '</div>' : '') + '</div>' +
+    (meta.status === 'reveal' && !local ? mpTopHTML(d) : '');
+}
+// Свой результат — сразу, по тем же правилам, что и в таблице
+function mpLocalResult(meta, s) {
+  const q = QUIZ_QUESTIONS[s.qi], mine = MP.mine[s.qi];
+  const a = s.my || (mine && (mine.state === 'ok' || mine.state === 'sending') ? mine : null);
+  if (!a || !a.choice) return { local: true, answered: false };
+  const sort = arr => Object.values(arr).map(Number).sort((x, y) => x - y).join(',');
+  const ok = sort(a.choice) === sort(q.correct), shownMs = mpShown(meta) * 1000;
+  const el = Math.min(Math.max(0, typeof a.el === 'number' ? a.el : shownMs), shownMs);
+  return { local: true, answered: true, correct: ok, pending: !s.my && mine && mine.state === 'sending',
+    points: ok ? MP_BASE_POINTS + Math.round(MP_SPEED_POINTS * Math.max(0, 1 - el / shownMs)) : 0 };
+}
+
 function mpRenderPlayer(d, meta, body, footer, s) {
   const q = s.qi >= 0 ? QUIZ_QUESTIONS[s.qi] : null;
   if (meta.status === 'lobby') {
@@ -5441,6 +5524,14 @@ function mpRenderPlayer(d, meta, body, footer, s) {
     footer.innerHTML = ''; return;
   }
   if (meta.status === 'question' || meta.status === 'closed') {
+    // время вышло: свой результат участник видит сразу (правильные ответы есть в квизе), рейтинг — после подсчёта
+    const allIn = s.nPlayers > 0 && Object.keys(s.answers).length >= s.nPlayers && !!s.my;   // ответили все — ждать нечего
+    if (meta.status === 'closed' || MP.preQ === s.qi || allIn) {
+      MP.preQ = s.qi; MP.locked = true;
+      body.innerHTML = mpPlayerResultHTML(d, meta, s, mpLocalResult(meta, s));
+      footer.innerHTML = '<div class="mp-note">⏳ Считаем баллы всех участников — рейтинг через несколько секунд…</div>';
+      return;
+    }
     const mine = MP.mine[s.qi];
     const answered = !!s.my || (mine && (mine.state === 'sending' || mine.state === 'ok'));
     const open = meta.status === 'question' && !meta.pausedAt;
@@ -5460,14 +5551,7 @@ function mpRenderPlayer(d, meta, body, footer, s) {
     return;
   }
   if (meta.status === 'reveal') {
-    const r = s.res && s.res[MP.uid];
-    const correctNames = q.correct.map(i => q.opts[i]).join(', ');
-    const fb = !r || !r.answered ? '<div class="quiz-feedback show wrong-fb"><b>⏱ Вы не успели ответить.</b> Правильный ответ: <b>' + mpEsc(correctNames) + '</b>'
-      : r.correct ? '<div class="quiz-feedback show correct-fb"><b>✅ Верно! +' + mpFmt(r.points) + ' ' + pointsWord(r.points) + '</b>'
-      : '<div class="quiz-feedback show wrong-fb"><b>❌ Неверно.</b> Правильный ответ: <b>' + mpEsc(correctNames) + '</b>';
-    body.innerHTML = mpStepHTML(s.qi) + '<div class="quiz-question-text">' + mpEsc(q.text) + '</div>' +
-      mpOptionsHTML(q, meta, 'reveal', s.my, mpCounts(s.answers, q), s.nPlayers) +
-      fb + (q.hint ? '<div class="quiz-hint">💡 ' + mpEsc(q.hint) + '</div>' : '') + '</div>' + mpTopHTML(d);
+    body.innerHTML = mpPlayerResultHTML(d, meta, s, s.res && s.res[MP.uid]);
     footer.innerHTML = '<div class="mp-note">Ждём следующий вопрос от ведущего…</div>';
     return;
   }
@@ -5531,6 +5615,15 @@ function mpRenderHostMain(d, meta, body, footer, s) {
   }
   if (meta.status === 'question' || meta.status === 'closed') {
     const nAns = Object.keys(s.answers).length;
+    if (MP.revealing) {
+      // время вышло: правильный ответ и распределение ответов — сразу, баллы и рейтинг досчитываются
+      body.innerHTML = mpStepHTML(s.qi) + '<div class="quiz-question-text">' + mpEsc(q.text) + '</div>' +
+        mpOptionsHTML(q, meta, 'host-reveal', null, mpCounts(s.answers, q), nAns) +
+        '<div class="mp-answered">Ответили <b>' + nAns + '</b> из ' + s.nPlayers + '</div>' +
+        (q.hint ? '<div class="quiz-feedback show correct-fb"><div class="quiz-hint">💡 ' + mpEsc(q.hint) + '</div></div>' : '');
+      footer.innerHTML = '<div class="mp-note">⏳ Считаем баллы и рейтинг…</div>';
+      return;
+    }
     body.innerHTML = mpTimerHTML() + mpStepHTML(s.qi) + '<div class="quiz-question-text">' + mpEsc(q.text) + '</div>' +
       mpOptionsHTML(q, meta, 'host', null, mpCounts(s.answers, q), nAns) +
       '<div class="mp-answered">Ответили <b>' + nAns + '</b> из ' + s.nPlayers + '</div>';
